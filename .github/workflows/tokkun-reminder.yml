@@ -1,8 +1,6 @@
 name: Tokkun Reminder
 
 on:
-  schedule:
-    - cron: "0 2 * * *"  # 毎朝 11:00 JST（UTC 2:00）
   workflow_dispatch:
     inputs:
       dry_run:

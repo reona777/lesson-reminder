@@ -26,12 +26,12 @@
 - **LINE Messaging API** — 生徒・保護者へのプッシュ通知（GAS経由）
 - **Slack Incoming Webhook** — LINE IDなし生徒の通知・講師向けリマインド
 - **Google Sheets API** — 保護者LINE IDの管理
-- **GitHub Actions** — 毎朝11:00 JST のスケジュール実行
+- **GitHub Actions** — `workflow_dispatch` で外部cronから起動
 
 ## アーキテクチャ
 
 ```
-GitHub Actions（毎朝 11:00 JST）
+外部cron（毎朝 11:00 JST）→ GitHub API（workflow_dispatch）
   ↓
 tokkun_reminder_runner.py
   ├─ Salesforce SOQL → 翌日の授業一覧取得
@@ -90,6 +90,17 @@ python tokkun_reminder_runner.py --dry-run
 | `CREDENTIALS_JSON` | Google サービスアカウントJSON（文字列） |
 | `PARENT_LINE_SPREADSHEET_ID` | 保護者LINE IDを管理するスプレッドシートID（任意） |
 | `PARENT_NOTIFY_TARGET_NAMES` | 保護者にも通知する生徒名（カンマ区切り、任意） |
+
+**定期実行**: GitHub ActionsのスケジュールトリガーはPublicリポジトリで不安定なため、外部cronサービス（[cron-job.org](https://cron-job.org) 等）からGitHub APIの `workflow_dispatch` エンドポイントを叩いて毎朝起動しています。
+
+```bash
+# 外部cronから叩くAPIコール例
+curl -X POST \
+  -H "Authorization: Bearer YOUR_GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  https://api.github.com/repos/YOUR_USERNAME/lesson-reminder/actions/workflows/tokkun-reminder.yml/dispatches \
+  -d '{"ref":"master","inputs":{"dry_run":"false"}}'
+```
 
 **手動実行**: Actions → Tokkun Reminder → Run workflow
 - `dry_run=true`: 送信せずログ確認のみ
