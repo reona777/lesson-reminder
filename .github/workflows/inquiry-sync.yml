@@ -1,0 +1,41 @@
+name: Inquiry Sync
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: inquiry-sync
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright pandas gspread google-auth python-dateutil
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Set up credentials
+        env:
+          CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+        run: echo "$CREDENTIALS_JSON" > credentials.json
+
+      - name: Run sync
+        env:
+          PORTAL_EMAIL: ${{ secrets.PORTAL_EMAIL }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SCHOOL_NAME: ${{ secrets.SCHOOL_NAME }}
+          INQUIRY_SHEET_NAME: ${{ secrets.INQUIRY_SHEET_NAME }}
+          INQUIRY_SOURCE_LABEL: ${{ secrets.INQUIRY_SOURCE_LABEL }}
+          LOGIN_URL: ${{ secrets.LOGIN_URL }}
+        run: python main.py

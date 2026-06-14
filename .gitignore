@@ -1,0 +1,11 @@
+.env
+credentials.json
+token.json
+downloads/
+/tmp/
+*.csv
+.tokkun-reminder-state/
+__pycache__/
+*.pyc
+.venv/
+venv/

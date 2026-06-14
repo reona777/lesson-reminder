@@ -1,0 +1,9 @@
+python-dotenv==1.0.1
+simple-salesforce==1.12.6
+requests==2.32.3
+rapidfuzz==3.9.7
+gspread==6.1.4
+google-auth==2.29.0
+pandas==2.2.2
+python-dateutil==2.9.0
+playwright==1.44.0

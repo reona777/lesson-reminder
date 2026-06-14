@@ -1,0 +1,97 @@
+name: Tokkun Reminder
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # 毎朝 11:00 JST（UTC 2:00）
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true にすると送信せずログ確認だけ実行。false で本番送信。"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tokkun-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Tokyo
+      SF_USERNAME: ${{ secrets.SF_USERNAME }}
+      SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
+      SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
+      GAS_URL: ${{ secrets.GAS_URL }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      SLACK_TEACHER_WEBHOOK: ${{ secrets.SLACK_TEACHER_WEBHOOK }}
+      CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+      PARENT_LINE_SPREADSHEET_ID: ${{ secrets.PARENT_LINE_SPREADSHEET_ID }}
+      PARENT_LINE_SHEET_NAME: ${{ secrets.PARENT_LINE_SHEET_NAME }}
+      PARENT_NOTIFY_TARGET_NAMES: ${{ secrets.PARENT_NOTIFY_TARGET_NAMES }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set state file
+        id: state
+        run: |
+          SENT_DATE=$(date +%F)
+          SENT_FILE=".tokkun-reminder-state/${SENT_DATE}.txt"
+          echo "date=${SENT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "file=${SENT_FILE}" >> "$GITHUB_OUTPUT"
+          echo "Sent marker file: ${SENT_FILE}"
+
+      - name: Check sent marker
+        id: sent_marker
+        run: |
+          if [ -f "${{ steps.state.outputs.file }}" ]; then
+            echo "sent=true" >> "$GITHUB_OUTPUT"
+            echo "Already sent today. Skipping production send."
+          else
+            echo "sent=false" >> "$GITHUB_OUTPUT"
+            echo "No sent marker found for today."
+          fi
+
+      - name: Set up Python
+        if: steps.sent_marker.outputs.sent != 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false')
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.sent_marker.outputs.sent != 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false')
+        run: pip install -r requirements.txt
+
+      - name: Run reminder
+        if: steps.sent_marker.outputs.sent != 'true' || (github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false')
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" != "false" ]; then
+            echo "Manual run dry_run is enabled. No LINE/Slack messages will be sent."
+            python tokkun_reminder_runner.py --dry-run
+          elif [ "${{ steps.sent_marker.outputs.sent }}" = "true" ]; then
+            echo "Already sent today. No LINE/Slack messages will be sent."
+          else
+            echo "Production run. LINE/Slack messages will be sent."
+            python tokkun_reminder_runner.py
+          fi
+
+      - name: Record sent marker
+        if: success() && steps.sent_marker.outputs.sent != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false')
+        run: |
+          mkdir -p .tokkun-reminder-state
+          {
+            echo "sent_at_jst=$(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "workflow_run=${GITHUB_RUN_ID}"
+            echo "commit=${GITHUB_SHA}"
+          } > "${{ steps.state.outputs.file }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.state.outputs.file }}"
+          git commit -m "Record reminder sent ${{ steps.state.outputs.date }}"
+          git push
