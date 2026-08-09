@@ -1,4 +1,4 @@
-name: Tokkun Reminder
+name: Lesson Reminder
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: tokkun-reminder
+  group: lesson-reminder
   cancel-in-progress: false
 
 jobs:
@@ -49,7 +49,7 @@ jobs:
         id: state
         run: |
           SENT_DATE=$(date +%F)
-          SENT_FILE=".tokkun-reminder-state/${SENT_DATE}.txt"
+          SENT_FILE=".lesson-reminder-state/${SENT_DATE}.txt"
           echo "date=${SENT_DATE}" >> "$GITHUB_OUTPUT"
           echo "file=${SENT_FILE}" >> "$GITHUB_OUTPUT"
           echo "Sent marker file: ${SENT_FILE}"
@@ -81,18 +81,18 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" != "false" ]; then
             echo "Manual run dry_run is enabled. No LINE/Slack messages will be sent."
-            python tokkun_reminder_runner.py --dry-run
+            python lesson_reminder_runner.py --dry-run
           elif [ "${{ steps.sent_marker.outputs.sent }}" = "true" ]; then
             echo "Already sent today. No LINE/Slack messages will be sent."
           else
             echo "Production run. LINE/Slack messages will be sent."
-            python tokkun_reminder_runner.py
+            python lesson_reminder_runner.py
           fi
 
       - name: Record sent marker
         if: success() && steps.sent_marker.outputs.sent != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run != 'false')
         run: |
-          mkdir -p .tokkun-reminder-state
+          mkdir -p .lesson-reminder-state
           {
             echo "sent_at_jst=$(date '+%Y-%m-%d %H:%M:%S %Z')"
             echo "workflow_run=${GITHUB_RUN_ID}"

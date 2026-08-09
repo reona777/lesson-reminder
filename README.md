@@ -43,7 +43,7 @@ Salesforceのデータを直接参照して自動化することで、毎日の�
 ```
 外部cron（毎日 3:07 UTC = 12:07 JST）→ GitHub API（workflow_dispatch）
   ↓
-tokkun_reminder_runner.py
+lesson_reminder_runner.py
   ├─ Salesforce SOQL → 翌日の授業一覧を取得
   ├─ GAS Webアプリ  → 生徒のLINE ID・講師のSlack IDを取得（合言葉付き・3回リトライ）
   ├─ Google Sheets  → 保護者LINE IDを取得（任意）
@@ -61,7 +61,7 @@ tokkun_reminder_runner.py
 ## 実装上の工夫
 
 - **fuzzy一致**（rapidfuzz）でSlack IDを検索し、Salesforce側の講師名の表記ゆれに対応
-- **冪等性の担保**: `.tokkun-reminder-state/` に送信済みマーカーをコミットし、同日の二重送信を防止
+- **冪等性の担保**: `.lesson-reminder-state/` に送信済みマーカーをコミットし、同日の二重送信を防止
 - **失敗したら送らない**: 名簿が取れなければ送信せず異常終了する。中途半端に送るより、送らずに気づける状態にする
 - **`--dry-run` モード**: LINE/Slackへ送信せず、取得内容と送信文面だけを確認できる
 - **固有名をコードに書かない**: 保護者通知の対象者もコース名の判定表も環境変数から読み込む。組織ごとに違う値をコードに残さない
@@ -119,7 +119,7 @@ cp .env.example .env
 ### 3. ローカルでのテスト実行
 
 ```bash
-python tokkun_reminder_runner.py --dry-run
+python lesson_reminder_runner.py --dry-run
 ```
 
 ### 4. テスト
@@ -155,11 +155,11 @@ pytest tests/ -q
 curl -X POST \
   -H "Authorization: Bearer YOUR_GITHUB_TOKEN" \
   -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/YOUR_USERNAME/lesson-reminder/actions/workflows/tokkun-reminder.yml/dispatches \
+  https://api.github.com/repos/YOUR_USERNAME/lesson-reminder/actions/workflows/lesson-reminder.yml/dispatches \
   -d '{"ref":"master","inputs":{"dry_run":"false"}}'
 ```
 
-**手動実行**: Actions → Tokkun Reminder → Run workflow
+**手動実行**: Actions → Lesson Reminder → Run workflow
 
 - `dry_run=true`: 送信せずログ確認のみ
 - `dry_run=false`: 本番送信
@@ -190,8 +190,8 @@ GitHub Actionsから実行する場合は `inquiry-sync.yml` ワークフロー�
 
 ```
 lesson-reminder/
-├── tokkun_reminder.py          # Salesforce取得・LINE/Slack送信のコア処理
-├── tokkun_reminder_runner.py   # ラッパー（名称の正規化・保護者LINE統合）
+├── lesson_reminder.py          # Salesforce取得・LINE/Slack送信のコア処理
+├── lesson_reminder_runner.py   # ラッパー（名称の正規化・保護者LINE統合）
 ├── main.py                     # 問い合わせCSVダウンロード→スプレッドシート転記
 ├── tests/
 │   └── test_course_rules.py    # コース判定・体験回・除外キーワードのテスト
@@ -199,7 +199,7 @@ lesson-reminder/
 ├── .env.example
 ├── .gitignore
 └── .github/workflows/
-    ├── tokkun-reminder.yml     # 外部cronからディスパッチされる本体
+    ├── lesson-reminder.yml     # 外部cronからディスパッチされる本体
     └── inquiry-sync.yml        # 手動実行（問い合わせ同期）
 ```
 

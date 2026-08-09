@@ -192,14 +192,14 @@ def course_label(s):
         m = pattern.search(c)
         if m:
             return m.group(0)
-    return clean(s["特訓名"])
+    return clean(s["授業名"])
 
 
 def get_msg(s):
     t = course_label(s)
     o = get_offset(s)
     return (
-        f"{s['生徒氏名']}さん\n明日の特訓の詳細です。\n"
+        f"{s['生徒氏名']}さん\n明日の授業の詳細です。\n"
         f"コース・教科：{t}　{s['科目']}\n"
         f"{shift(s['開始時間'], o)}‐{s['終了時間']}\n"
         f"担当：{s['担当']}\nお待ちしております。\nこの通知に返信不要です。"
@@ -207,7 +207,7 @@ def get_msg(s):
 
 
 def fetch_report(sf):
-    print("📊 特訓データ取得中（SOQL）...")
+    print("📊 授業データ取得中（SOQL）...")
     tomorrow = (datetime.now(JST) + timedelta(days=1)).strftime("%Y-%m-%d")
     records = sf.query_all(
         f"SELECT Name, MANAERP__Start_Date_Time__c, MANAERP__End_Date_Time__c, "
@@ -219,14 +219,14 @@ def fetch_report(sf):
     students = []
     skipped = 0
     for r in records:
-        tokkun = r.get("Name", "")
-        m = re.search(r"\[([^\]]+)\]", tokkun)
+        lesson_name = r.get("Name", "")
+        m = re.search(r"\[([^\]]+)\]", lesson_name)
         name = m.group(1).strip() if m else ""
         if not name:
             continue
-        if is_skipped_lesson(tokkun):
+        if is_skipped_lesson(lesson_name):
             skipped += 1
-            print(f"⏭️ 対象外のためスキップ: {name} / {tokkun}")
+            print(f"⏭️ 対象外のためスキップ: {name} / {lesson_name}")
             continue
         students.append(
             {
@@ -234,9 +234,9 @@ def fetch_report(sf):
                 "開始時間": utc_to_jst(r.get("MANAERP__Start_Date_Time__c", "")),
                 "終了時間": utc_to_jst(r.get("MANAERP__End_Date_Time__c", "")),
                 "担当": (r.get("MANAERP__Teacher__c") or "").strip(),
-                "特訓名": tokkun,
-                "コース名": tokkun,
-                "科目": extract_subject(tokkun),
+                "授業名": lesson_name,
+                "コース名": lesson_name,
+                "科目": extract_subject(lesson_name),
                 "lineUserId": "",
                 "parentLineUserId": "",
                 "_start_dt": utc_to_jst_dt(r.get("MANAERP__Start_Date_Time__c", "")),
@@ -385,7 +385,7 @@ def notify_slack_teacher_remind(students, slack_map):
     tomorrow = datetime.now(JST) + timedelta(days=1)
     date_str = tomorrow.strftime(f"%Y/%m/%d({WEEKDAY_JA[tomorrow.weekday()]})")
 
-    lines = [f"📅 *明日の特訓リマインド　{date_str}*"]
+    lines = [f"📅 *明日の授業リマインド　{date_str}*"]
     for teacher, lessons in sorted(by_teacher.items()):
         slack_id, _score = find_slack_id(teacher, slack_map)
         mention = f"<@{slack_id}>" if slack_id else f"@{teacher}"
@@ -424,7 +424,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 50)
-    print("  📱 特訓LINE送信ツール")
+    print("  📱 授業LINE送信ツール")
     print(f"  {datetime.now(JST).strftime('%Y-%m-%d %H:%M')}")
     print("=" * 50)
 

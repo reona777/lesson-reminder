@@ -1,6 +1,6 @@
-"""Runner for Tokkun reminders.
+"""Runner for lesson reminders.
 
-This wraps the main reminder script and normalizes Salesforce Tokkun names before
+This wraps the main reminder script and normalizes Salesforce lesson names before
 message generation. It keeps the original script small while adding operational
 cleanup rules.
 """
@@ -11,24 +11,24 @@ import re
 import unicodedata
 from urllib.parse import quote
 
-import tokkun_reminder
+import lesson_reminder
 
 PARENT_LINE_SPREADSHEET_ID = os.getenv("PARENT_LINE_SPREADSHEET_ID", "")
 PARENT_LINE_SHEET_NAME = os.getenv("PARENT_LINE_SHEET_NAME", "line")
 
-PARENT_NOTIFY_TARGET_NAMES = tokkun_reminder.PARENT_NOTIFY_TARGET_NAMES
-tokkun_reminder.PARENT_NOTIFY_TARGET_NAMES = PARENT_NOTIFY_TARGET_NAMES
+PARENT_NOTIFY_TARGET_NAMES = lesson_reminder.PARENT_NOTIFY_TARGET_NAMES
+lesson_reminder.PARENT_NOTIFY_TARGET_NAMES = PARENT_NOTIFY_TARGET_NAMES
 
 
-def clean_tokkun_name(value):
+def clean_lesson_name(value):
     text = unicodedata.normalize("NFKC", value or "").strip()
     text = re.sub(r"^(?:\d{2,4}年)?\d{1,2}/\d{1,2}分", "", text).strip()
     text = re.sub(r"^\[[^\]]*\]", "", text).strip()
     return text
 
 
-_original_fetch_report = tokkun_reminder.fetch_report
-_original_fetch_ids = tokkun_reminder.fetch_ids
+_original_fetch_report = lesson_reminder.fetch_report
+_original_fetch_ids = lesson_reminder.fetch_ids
 
 
 def fetch_report_with_extra_filter(sf):
@@ -42,8 +42,8 @@ def fetch_report_with_extra_filter(sf):
     filtered = []
     skipped = 0
     for student in students:
-        lesson_name = clean_tokkun_name(student.get("特訓名", ""))
-        if tokkun_reminder.is_skipped_lesson(lesson_name):
+        lesson_name = clean_lesson_name(student.get("授業名", ""))
+        if lesson_reminder.is_skipped_lesson(lesson_name):
             skipped += 1
             print(f"Skip lesson: {student.get('生徒氏名', '')} / {lesson_name}")
             continue
@@ -112,7 +112,7 @@ def fetch_parent_line_map_from_sheet():
     for row in rows[1:]:
         parent_uid = row[4].strip() if len(row) > 4 else ""
         student_name = row[6].strip() if len(row) > 6 else ""
-        name_key = tokkun_reminder.normalize(student_name)
+        name_key = lesson_reminder.normalize(student_name)
         if name_key in PARENT_NOTIFY_TARGET_NAMES and parent_uid:
             parent_map[name_key] = parent_uid
 
@@ -131,10 +131,10 @@ def fetch_ids_with_parent_sheet():
     return line_map, parent_line_map, slack_map
 
 
-tokkun_reminder.clean = clean_tokkun_name
-tokkun_reminder.fetch_report = fetch_report_with_extra_filter
-tokkun_reminder.fetch_ids = fetch_ids_with_parent_sheet
+lesson_reminder.clean = clean_lesson_name
+lesson_reminder.fetch_report = fetch_report_with_extra_filter
+lesson_reminder.fetch_ids = fetch_ids_with_parent_sheet
 
 
 if __name__ == "__main__":
-    tokkun_reminder.main()
+    lesson_reminder.main()

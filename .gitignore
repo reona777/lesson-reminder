@@ -4,7 +4,7 @@ token.json
 downloads/
 /tmp/
 *.csv
-.tokkun-reminder-state/
+.lesson-reminder-state/
 __pycache__/
 *.pyc
 .venv/

@@ -1,6 +1,6 @@
 """コース名の判定表・体験回・除外キーワードの挙動を確認する。
 
-tokkun_reminder は import 時に必須の環境変数を読むので、import より前に
+lesson_reminder は import 時に必須の環境変数を読むので、import より前に
 ダミー値を入れておく必要がある。
 """
 import importlib
@@ -25,19 +25,19 @@ BASE_ENV = {
 
 
 def load(**overrides):
-    """指定した環境変数で tokkun_reminder を読み込み直す。"""
+    """指定した環境変数で lesson_reminder を読み込み直す。"""
     for key in list(os.environ):
         if key in BASE_ENV or key in ("TRIAL_PATTERN", "TRIAL_EXCEPT_PATTERN"):
             del os.environ[key]
     os.environ.update(BASE_ENV)
     os.environ.update(overrides)
-    if "tokkun_reminder" in sys.modules:
-        return importlib.reload(sys.modules["tokkun_reminder"])
-    return importlib.import_module("tokkun_reminder")
+    if "lesson_reminder" in sys.modules:
+        return importlib.reload(sys.modules["lesson_reminder"])
+    return importlib.import_module("lesson_reminder")
 
 
 def lesson(name):
-    return {"コース名": name, "特訓名": name}
+    return {"コース名": name, "授業名": name}
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_通知文に前倒し後の開始時刻が入る():
     msg = tr.get_msg(
         {
             "コース名": "[山田太郎]標準コースL(英):指導枠",
-            "特訓名": "[山田太郎]標準コースL(英):指導枠",
+            "授業名": "[山田太郎]標準コースL(英):指導枠",
             "生徒氏名": "山田太郎",
             "科目": "英",
             "開始時間": "16:00",
