@@ -47,6 +47,9 @@ SF_USERNAME = required_env("SF_USERNAME")
 SF_PASSWORD = required_env("SF_PASSWORD")
 SF_SECURITY_TOKEN = required_env("SF_SECURITY_TOKEN")
 GAS_URL = required_env("GAS_URL")
+# GAS側の名簿取得・送信は合言葉（スクリプトプロパティ ROSTER_TOKEN）で保護されている。
+# 一致しないと doGet も doPost も {"error": "unauthorized"} しか返さない。
+ROSTER_TOKEN = required_env("ROSTER_TOKEN")
 SLACK_WEBHOOK = required_env("SLACK_WEBHOOK")
 SLACK_TEACHER_WEBHOOK = required_env("SLACK_TEACHER_WEBHOOK")
 
@@ -66,6 +69,50 @@ def _load_parent_notify_targets() -> set:
 
 
 PARENT_NOTIFY_TARGET_NAMES: set = _load_parent_notify_targets()
+
+
+def _load_course_rules() -> list:
+    """環境変数 COURSE_RULES からコース名の判定表を読み込む。
+
+    書式は `正規表現:前倒し時間` のカンマ区切り。前から順に評価し、最初に
+    一致したものを採用する。前倒し時間は、コースによって「授業の開始時刻が
+    レコード上の時刻より N 時間早い」という運用差を吸収するためのもの。
+
+        COURSE_RULES=標準コースL:2,標準コースS:1,短期コース:0
+
+    コース名は組織ごとに違うのでコードに書かない。未設定なら前倒しはせず、
+    表示ラベルにはレコードの名称をそのまま使う。
+    """
+    rules = []
+    for entry in os.getenv("COURSE_RULES", "").split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        pattern, _, hours = entry.rpartition(":")
+        pattern = pattern.strip()
+        try:
+            offset = int(hours.strip())
+        except ValueError:
+            print(f"⚠️ COURSE_RULES の前倒し時間が数値ではありません: {entry}")
+            continue
+        try:
+            rules.append((re.compile(pattern), offset))
+        except re.error as e:
+            print(f"⚠️ COURSE_RULES の正規表現が不正です: {entry} ({e})")
+    return rules
+
+
+COURSE_RULES: list = _load_course_rules()
+
+# 体験回はコース名が同じでも開始時刻が前倒しにならない。
+# 2回目以降の体験（体験2 / 体験２ / 体験②）は通常回と同じ扱いにする。
+TRIAL_PATTERN = re.compile(os.getenv("TRIAL_PATTERN", "体験"))
+TRIAL_EXCEPT_PATTERN = re.compile(os.getenv("TRIAL_EXCEPT_PATTERN", "体験[2２②]"))
+
+# 名称にこのキーワードを含む授業はリマインドしない（担当未定の仮枠・社内研修など）
+SKIP_LESSON_KEYWORDS = [
+    kw.strip() for kw in os.getenv("SKIP_LESSON_KEYWORDS", "").split(",") if kw.strip()
+]
 
 
 def utc_to_jst(s):
@@ -101,18 +148,26 @@ def clean(s):
     return re.sub(r"^\[[^\]]*\]", "", s or "").strip()
 
 
-def is_undecided_tokkun(tokkun_name):
-    """特訓名の接頭に「未定」がある、または「研修」を含む場合はリマインド対象外にする。"""
-    c = clean(tokkun_name)
-    return c.startswith("未定") or "研修" in c
+def is_skipped_lesson(lesson_name):
+    """リマインド対象外にする授業かどうか。
+
+    担当がまだ決まっていない仮押さえの枠や、生徒が関与しない社内向けの枠が
+    同じオブジェクトに入っているため、名称のキーワードで除外する。
+    どのキーワードで弾くかは組織ごとに違うので環境変数で渡す。
+    """
+    c = clean(lesson_name)
+    return any(kw in c for kw in SKIP_LESSON_KEYWORDS)
 
 
 def get_offset(s):
-    c = clean(s["コース名"])
-    if re.search(r"個別管理特訓L", c):
-        return 2
-    if re.search(r"個別管理特訓S", c):
-        return 1
+    raw = s["コース名"]
+    # 体験回に前倒しを適用すると1〜2時間早い時刻でLINE通知してしまう。
+    if TRIAL_PATTERN.search(raw) and not TRIAL_EXCEPT_PATTERN.search(raw):
+        return 0
+    c = clean(raw)
+    for pattern, offset in COURSE_RULES:
+        if pattern.search(c):
+            return offset
     return 0
 
 
@@ -126,10 +181,22 @@ def shift(v, o):
     return f"{t // 60}:{t % 60:02d}"
 
 
-def get_msg(s):
+def course_label(s):
+    """通知文に出すコース名。COURSE_RULES に一致した部分だけを抜き出す。
+
+    レコードの名称には枠や科目などの付随情報が混ざるので、判定表に載っている
+    コース名の部分だけを表示する。どれにも一致しなければ名称をそのまま使う。
+    """
     c = clean(s["コース名"])
-    m = re.search(r"(個別管理特訓[LS]|完全指導特訓[LS]|独学支援特訓[LS]?|宿題確認特訓[LS]?|体験特訓)", c)
-    t = m.group(1) if m else clean(s["特訓名"])
+    for pattern, _offset in COURSE_RULES:
+        m = pattern.search(c)
+        if m:
+            return m.group(0)
+    return clean(s["特訓名"])
+
+
+def get_msg(s):
+    t = course_label(s)
     o = get_offset(s)
     return (
         f"{s['生徒氏名']}さん\n明日の特訓の詳細です。\n"
@@ -150,16 +217,16 @@ def fetch_report(sf):
         f"ORDER BY MANAERP__Start_Date_Time__c"
     ).get("records", [])
     students = []
-    skipped_undecided = 0
+    skipped = 0
     for r in records:
         tokkun = r.get("Name", "")
         m = re.search(r"\[([^\]]+)\]", tokkun)
         name = m.group(1).strip() if m else ""
         if not name:
             continue
-        if is_undecided_tokkun(tokkun):
-            skipped_undecided += 1
-            print(f"⏭️ 未定のためスキップ: {name} / {tokkun}")
+        if is_skipped_lesson(tokkun):
+            skipped += 1
+            print(f"⏭️ 対象外のためスキップ: {name} / {tokkun}")
             continue
         students.append(
             {
@@ -176,8 +243,8 @@ def fetch_report(sf):
             }
         )
     print(f"✅ {len(students)}名取得")
-    if skipped_undecided:
-        print(f"⏭️ 未定の特訓を {skipped_undecided}件スキップ")
+    if skipped:
+        print(f"⏭️ 対象外の授業を {skipped}件スキップ")
     return students
 
 
@@ -219,21 +286,37 @@ def build_parent_line_map(data, students_data):
     return parent_map
 
 
-def fetch_ids():
+def fetch_ids(retries=3):
+    """GASから名簿を取得する。
+
+    GASが一時的にJSON以外（エラーHTML等）を返すことがあり、1回失敗しただけで
+    名簿が空になると全員が「LINE IDなし」に落ちて誰にも送信されない。
+    そのため数回リトライする。
+    """
     print("🔑 LINE ID / Slack ID取得中...")
-    try:
-        data = requests.get(GAS_URL, timeout=15).json()
-        students_data = data.get("students", [])
-        line_map = {normalize(s.get("name", "")): s.get("id", "") for s in students_data}
-        parent_line_map = build_parent_line_map(data, students_data)
-        slack_map = {normalize(k): v for k, v in data.get("slackIds", {}).items()}
-        print(
-            f"✅ LINE:{len(line_map)}件 / 保護者LINE:{len(parent_line_map)}件 / Slack:{len(slack_map)}件取得"
-        )
-        return line_map, parent_line_map, slack_map
-    except Exception as e:
-        print(f"⚠️ {e}")
-        return {}, {}, {}
+    last_error = ""
+    for attempt in range(1, retries + 1):
+        try:
+            res = requests.get(GAS_URL, params={"token": ROSTER_TOKEN}, timeout=30)
+            res.raise_for_status()
+            data = res.json()
+            students_data = data.get("students", [])
+            line_map = {normalize(s.get("name", "")): s.get("id", "") for s in students_data}
+            if not line_map:
+                raise ValueError("GASの返却JSONに students が含まれていません")
+            parent_line_map = build_parent_line_map(data, students_data)
+            slack_map = {normalize(k): v for k, v in data.get("slackIds", {}).items()}
+            print(
+                f"✅ LINE:{len(line_map)}件 / 保護者LINE:{len(parent_line_map)}件 / Slack:{len(slack_map)}件取得"
+            )
+            return line_map, parent_line_map, slack_map
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            print(f"⚠️ 名簿取得失敗（{attempt}/{retries}）: {last_error}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+    print(f"❌ 名簿取得に{retries}回失敗しました: {last_error}")
+    return {}, {}, {}
 
 
 def find_slack_id(teacher, slack_map):
@@ -318,11 +401,16 @@ def notify_slack_teacher_remind(students, slack_map):
 
 
 def send(s):
+    # タイムアウトしてもGAS側では送信済みのことがあるためリトライはしない。
+    # 待ち時間だけ長めに取って取りこぼしを減らす。
     try:
         r = requests.post(
             GAS_URL,
-            json={"students": [{"lineUserId": s["lineUserId"], "name": s["生徒氏名"], "message": get_msg(s)}]},
-            timeout=15,
+            json={
+                "token": ROSTER_TOKEN,
+                "students": [{"lineUserId": s["lineUserId"], "name": s["生徒氏名"], "message": get_msg(s)}],
+            },
+            timeout=30,
         ).json()
         res = r.get("results", [{}])[0]
         return res.get("status") == "sent", res.get("error", "")
@@ -350,6 +438,11 @@ def main():
 
     students = fetch_report(sf)
     line_map, parent_line_map, slack_map = fetch_ids()
+    if students and not line_map:
+        # 名簿が空のまま進むと全員が「LINE IDなし」になり誰にも届かない。
+        # 異常終了して送信済みマーカーを残さず、次回実行で自動的に再試行させる。
+        print("❌ LINE名簿を取得できませんでした。全員未送信になるのを防ぐため中止します。")
+        sys.exit(1)
     for s in students:
         name_key = normalize(s["生徒氏名"])
         s["lineUserId"] = line_map.get(name_key, "")

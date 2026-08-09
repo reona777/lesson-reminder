@@ -31,19 +31,25 @@ _original_fetch_report = tokkun_reminder.fetch_report
 _original_fetch_ids = tokkun_reminder.fetch_ids
 
 
-def fetch_report_without_training(sf):
+def fetch_report_with_extra_filter(sf):
+    """Apply SKIP_LESSON_KEYWORDS again after this runner's stricter cleanup.
+
+    The base module already filters, but the runner also strips a leading date
+    prefix from lesson names. A second pass catches rows whose keyword only
+    becomes visible after that extra normalization.
+    """
     students = _original_fetch_report(sf)
     filtered = []
     skipped = 0
     for student in students:
         lesson_name = clean_tokkun_name(student.get("特訓名", ""))
-        if "研修" in lesson_name:
+        if tokkun_reminder.is_skipped_lesson(lesson_name):
             skipped += 1
-            print(f"Skip training lesson: {student.get('生徒氏名', '')} / {lesson_name}")
+            print(f"Skip lesson: {student.get('生徒氏名', '')} / {lesson_name}")
             continue
         filtered.append(student)
     if skipped:
-        print(f"Skipped training lessons: {skipped}")
+        print(f"Skipped lessons: {skipped}")
     return filtered
 
 
@@ -126,7 +132,7 @@ def fetch_ids_with_parent_sheet():
 
 
 tokkun_reminder.clean = clean_tokkun_name
-tokkun_reminder.fetch_report = fetch_report_without_training
+tokkun_reminder.fetch_report = fetch_report_with_extra_filter
 tokkun_reminder.fetch_ids = fetch_ids_with_parent_sheet
 
 

@@ -7,6 +7,10 @@ on:
         description: "true にすると送信せずログ確認だけ実行。false で本番送信。"
         required: false
         default: "true"
+      test_notify:
+        description: "true にすると失敗していなくてもSlackの失敗通知を1回送る（通知の疎通確認用）。"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -25,6 +29,7 @@ jobs:
       SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
       SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
       GAS_URL: ${{ secrets.GAS_URL }}
+      ROSTER_TOKEN: ${{ secrets.ROSTER_TOKEN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
       SLACK_TEACHER_WEBHOOK: ${{ secrets.SLACK_TEACHER_WEBHOOK }}
       CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
@@ -34,6 +39,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # ディスパッチ時点の固定SHAではなく実行時点の最新ブランチを取得する。
+          # ランナー遅延で先行runのマーカーpush後に実行が始まっても、
+          # マーカーを正しく検出して二重送信を防ぐため。
+          ref: master
 
       - name: Set state file
         id: state
@@ -92,4 +102,20 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "${{ steps.state.outputs.file }}"
           git commit -m "Record reminder sent ${{ steps.state.outputs.date }}"
+          # push中に他のcommitが先行してもnon-fast-forwardで落ちないようにする
+          git pull --rebase origin master
           git push
+
+      # 失敗しても誰も気づけず、生徒に届かないまま終わる事故を防ぐ。
+      # マーカーを残さないので、次のディスパッチが自動リトライになる。
+      - name: Notify Slack on failure
+        if: ${{ failure() || inputs.test_notify == 'true' }}
+        run: |
+          if [ "${{ inputs.test_notify }}" = "true" ]; then
+            HEAD_LINE=":test_tube: [疎通テスト] リマインドの失敗通知です。実際の失敗ではありません。"
+          else
+            HEAD_LINE=":rotating_light: リマインドが失敗しました。生徒へのLINEが未送信の可能性があります。"
+          fi
+          TEXT=$(printf '%s\n実行: %s JST' "$HEAD_LINE" "$(date '+%m/%d %H:%M')")
+          jq -n --arg text "$TEXT" '{text: $text}' \
+            | curl -sS -f -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK"
