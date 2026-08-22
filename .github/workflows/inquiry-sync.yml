@@ -10,6 +10,13 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-22.04
+    # 保険。詰まったときに何時間も居座らせない（既定は360分）。
+    # 2026-08-19にaptのミラー待ちで3時間37分ハングし、その間の毎時実行が
+    # 待機のままキャンセルされ続けた。正常時は1〜8分で終わるので20分あれば足りる。
+    # ただしここで切られると conclusion は failure ではなく cancelled になり、
+    # GitHubの失敗通知は飛ばない（2026-08-19に実測）。通知を出す役目は下の
+    # timeout コマンドが持つ。ここは最後の砦。
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -20,9 +27,19 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # ランナー既定の apt は mirror+file:/etc/apt/apt-mirrors.txt を使い、
+          # クラウド事業者のミラーを先に見る。2026-08-19にそこが何時間も応答せず、
+          # 同期が半日止まった。生きている本家だけを見るように一覧を差し替える。
+          echo "https://archive.ubuntu.com/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          # 上で外し切れないミラーが残っていても、諦めるまでの時間を縛っておく
+          printf 'Acquire::Retries "2";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' | sudo tee /etc/apt/apt.conf.d/99-timeout > /dev/null
           pip install playwright pandas gspread google-auth python-dateutil
           playwright install chromium
-          playwright install-deps chromium
+          # 2026-08-19の実測では pip=10秒 / install chromium=14秒 で、詰まるのは必ずここ。
+          # ジョブの timeout-minutes に切られると cancelled 扱いになり失敗通知が消えるので、
+          # コマンド側で先に打ち切り、終了コード124で「失敗」にしてメールを飛ばす。
+          # 正常時は30秒ほどで終わる。
+          timeout 5m playwright install-deps chromium
 
       - name: Set up credentials
         env:

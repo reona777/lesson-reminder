@@ -113,3 +113,9 @@ def test_通知文に前倒し後の開始時刻が入る():
     )
     assert "標準コースL" in msg
     assert "14:00‐18:00" in msg
+
+
+def test_括弧が壊れていても除外判定は効く():
+    """開き括弧が抜けた授業名でも、対象外キーワードの判定は先に効かせる。"""
+    tr = load()
+    assert tr.is_skipped_lesson("未定8/5分山田太郎]標準コースS(英):指導枠") is True

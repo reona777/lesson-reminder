@@ -58,17 +58,11 @@ def normalize(s):
     return unicodedata.normalize("NFKC", s).replace(" ", "").replace("　", "").strip()
 
 
-def _load_parent_notify_targets() -> set:
-    """
-    環境変数 PARENT_NOTIFY_TARGET_NAMES からカンマ区切りで生徒名を読み込む。
-    例: PARENT_NOTIFY_TARGET_NAMES=山田太郎,佐藤花子
-    未設定の場合は空のセットを返す（保護者へのLINE通知なし）。
-    """
-    raw = os.getenv("PARENT_NOTIFY_TARGET_NAMES", "")
-    return {normalize(n.strip()) for n in raw.split(",") if n.strip()}
-
-
-PARENT_NOTIFY_TARGET_NAMES: set = _load_parent_notify_targets()
+# 保護者にもLINEを送る対象生徒。名簿シートのH列（保護者通知）のチェックで決まる。
+# 実行時に lesson_reminder_runner.py がシートを読んでこの集合を入れ替えるため、
+# ここは空で始める。希望者が増えてもコードは触らず、シートのチェックだけで足りる。
+# なお本ファイルを単体で実行すると保護者送信は行われない（運用は runner 経由）。
+PARENT_NOTIFY_TARGET_NAMES: set = set()
 
 
 def _load_course_rules() -> list:
@@ -159,6 +153,84 @@ def is_skipped_lesson(lesson_name):
     return any(kw in c for kw in SKIP_LESSON_KEYWORDS)
 
 
+# 授業名の先頭に付く振替元の日付メモ（例: 8/5分 / 2025/12/17分 / 27年2/24分）。
+DATE_PREFIX_RE = re.compile(r"^(?:\d{2,4}年)?\d{1,2}/\d{1,2}分")
+
+
+def parse_student_name(lesson_name):
+    """授業名から生徒名を取り出す。(生徒名, 推測かどうか) を返す。
+
+    正しい形は `[生徒名]…`。まれに開き括弧が抜けた `8/5分山田太郎]…` が作られており、
+    これを黙って捨てるとリマインドが届かないまま誰も気づけない（2026-08-12に発生）。
+    その場合は閉じ括弧の手前を候補として拾い、推測フラグ付きで返す。
+    推測した名前はLINE名簿に一致したときだけ送信する（split_unresolved_guesses）。
+    """
+    raw = lesson_name or ""
+    m = re.search(r"\[([^\]]+)\]", raw)
+    if m:
+        return m.group(1).strip(), False
+    # 全角の日付メモ（８／５分）も拾えるように正規化してから候補を切り出す。
+    m = re.match(r"^([^\[\]]*)\]", unicodedata.normalize("NFKC", raw))
+    if not m:
+        return "", False
+    candidate = DATE_PREFIX_RE.sub("", m.group(1)).strip()
+    return (candidate, True) if candidate else ("", False)
+
+
+def resolve_student_name(lesson_name, fallback_name):
+    """授業名から生徒名を取る。取れなければ授業予定側の生徒名で補う。
+
+    戻り値の2つ目は「推測かどうか」。推測はLINE名簿に一致したときだけ送信する。
+    授業名を優先するのは、LINE名簿が授業名と同じ表記で登録されているため
+    （例: 授業名と名簿は `渡辺翔太`、Salesforceの生徒名は `渡邊 翔太`）。
+    """
+    name, guessed = parse_student_name(lesson_name)
+    if name:
+        return name, guessed
+    if fallback_name:
+        return fallback_name.strip(), True
+    return "", False
+
+
+def fetch_student_names_by_lesson(sf, lesson_date):
+    """授業Id → 生徒名 の対応を引く。授業名が壊れているときの補完用。
+
+    MANAERP__Student_Sessions__c は授業にぶら下がる子レコードで、
+    MANAERP__Student_Name__c にSalesforce上の生徒名が入っている。
+    ただし全授業に付いているわけではない（対象外の枠や一部のレコードには無い）ので、
+    主経路にはせず補完だけに使う。取得に失敗しても従来どおりの動作に落ちるだけ。
+    """
+    try:
+        records = sf.query_all(
+            "SELECT MANAERP__Lesson__c, MANAERP__Student_Name__c "
+            "FROM MANAERP__Student_Sessions__c "
+            f"WHERE MANAERP__Lesson__r.MANAERP__Lesson_Date__c = {lesson_date}"
+        ).get("records", [])
+    except Exception as e:
+        print(f"⚠️ 授業予定の生徒名を取得できません（補完なしで続行）: {type(e).__name__}: {e}")
+        return {}
+    return {
+        r["MANAERP__Lesson__c"]: (r.get("MANAERP__Student_Name__c") or "").strip()
+        for r in records
+        if r.get("MANAERP__Student_Name__c")
+    }
+
+
+def split_unresolved_guesses(students):
+    """推測で拾った生徒名がLINE名簿に無い行を送信対象から外す。
+
+    括弧が壊れた授業名から拾った名前は誤っている可能性があるので、LINE IDが
+    引けたときだけ送る。引けなければ別人へ届くのを避けて手動送信の通知に回す。
+    """
+    resolved, unresolved = [], []
+    for s in students:
+        if s.get("_name_guessed") and not s.get("lineUserId"):
+            unresolved.append(s)
+        else:
+            resolved.append(s)
+    return resolved, unresolved
+
+
 def get_offset(s):
     raw = s["コース名"]
     # 体験回に前倒しを適用すると1〜2時間早い時刻でLINE通知してしまう。
@@ -210,42 +282,50 @@ def fetch_report(sf):
     print("📊 授業データ取得中（SOQL）...")
     tomorrow = (datetime.now(JST) + timedelta(days=1)).strftime("%Y-%m-%d")
     records = sf.query_all(
-        f"SELECT Name, MANAERP__Start_Date_Time__c, MANAERP__End_Date_Time__c, "
+        f"SELECT Id, Name, MANAERP__Start_Date_Time__c, MANAERP__End_Date_Time__c, "
         f"MANAERP__Teacher__c "
         f"FROM MANAERP__Lesson__c "
         f"WHERE MANAERP__Lesson_Date__c = {tomorrow} "
         f"ORDER BY MANAERP__Start_Date_Time__c"
     ).get("records", [])
+    lesson_students = fetch_student_names_by_lesson(sf, tomorrow)
     students = []
+    unparsed = []
     skipped = 0
     for r in records:
         lesson_name = r.get("Name", "")
-        m = re.search(r"\[([^\]]+)\]", lesson_name)
-        name = m.group(1).strip() if m else ""
-        if not name:
-            continue
+        name, guessed = resolve_student_name(lesson_name, lesson_students.get(r.get("Id"), ""))
         if is_skipped_lesson(lesson_name):
             skipped += 1
-            print(f"⏭️ 対象外のためスキップ: {name} / {lesson_name}")
+            print(f"⏭️ 対象外のためスキップ: {name or '(生徒名なし)'} / {lesson_name}")
             continue
-        students.append(
-            {
-                "生徒氏名": name,
-                "開始時間": utc_to_jst(r.get("MANAERP__Start_Date_Time__c", "")),
-                "終了時間": utc_to_jst(r.get("MANAERP__End_Date_Time__c", "")),
-                "担当": (r.get("MANAERP__Teacher__c") or "").strip(),
-                "授業名": lesson_name,
-                "コース名": lesson_name,
-                "科目": extract_subject(lesson_name),
-                "lineUserId": "",
-                "parentLineUserId": "",
-                "_start_dt": utc_to_jst_dt(r.get("MANAERP__Start_Date_Time__c", "")),
-            }
-        )
+        row = {
+            "生徒氏名": name,
+            "開始時間": utc_to_jst(r.get("MANAERP__Start_Date_Time__c", "")),
+            "終了時間": utc_to_jst(r.get("MANAERP__End_Date_Time__c", "")),
+            "担当": (r.get("MANAERP__Teacher__c") or "").strip(),
+            "授業名": lesson_name,
+            "コース名": lesson_name,
+            "科目": extract_subject(lesson_name),
+            "lineUserId": "",
+            "parentLineUserId": "",
+            "_name_guessed": guessed,
+            "_start_dt": utc_to_jst_dt(r.get("MANAERP__Start_Date_Time__c", "")),
+        }
+        if not name:
+            # 黙って捨てるとリマインドが届かないまま気づけないので通知に回す。
+            print(f"⚠️ 生徒名を授業名から取得できません: {lesson_name}")
+            unparsed.append(row)
+            continue
+        if guessed:
+            print(f"⚠️ 授業名から生徒名を確定できないため推測: {name} / {lesson_name}")
+        students.append(row)
     print(f"✅ {len(students)}名取得")
     if skipped:
         print(f"⏭️ 対象外の授業を {skipped}件スキップ")
-    return students
+    if unparsed:
+        print(f"⚠️ 生徒名を取得できない授業が {len(unparsed)}件")
+    return students, unparsed
 
 
 def get_first_value(item, keys):
@@ -345,7 +425,10 @@ def notify_slack_parent_uid_missing(students):
     }
     blocks = [header]
     for s in students:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{s['生徒氏名']}（保護者宛）*\n```{get_msg(s)}```"}})
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{s['生徒氏名']}（保護者宛）*\n```{get_msg(s)}```"},
+        })
     try:
         requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
         print("✅ Slack通知送信（保護者UID未登録）")
@@ -371,6 +454,71 @@ def notify_slack_no_id(students):
         print("✅ Slack通知送信（IDなし生徒）")
     except Exception as e:
         print(f"⚠️ Slack通知失敗: {e}")
+
+
+def notify_slack_unparsed(lessons):
+    """生徒を特定できなかった授業を通知する。
+
+    授業名の `[生徒名]` が壊れていると生徒を引けない。黙って落とすと
+    リマインドが届かないまま誰も気づけないので、手動送信を促す。
+    """
+    if not lessons:
+        return
+    header = {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                f"⚠️ *生徒を特定できない授業があります（{len(lessons)}件）*\n"
+                "授業名の `[生徒名]` が壊れている可能性があります。"
+                "Salesforceの授業名を直したうえで、手動でLINEを送信してください。"
+            ),
+        },
+    }
+    blocks = [header]
+    for s in lessons:
+        title = f"*{s['生徒氏名']}（推測・名簿に一致なし）*\n" if s.get("生徒氏名") else ""
+        detail = (
+            f"授業名：{s['授業名']}\n"
+            f"{s['開始時間']}‐{s['終了時間']}\n"
+            f"担当：{s['担当']}"
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{title}```{detail}```"}})
+    try:
+        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
+        print("✅ Slack通知送信（生徒を特定できない授業）")
+    except Exception as e:
+        print(f"⚠️ Slack通知失敗（生徒を特定できない授業）: {e}")
+
+
+def notify_slack_send_failed(failures):
+    """LINE送信に失敗した分を通知する。
+
+    ログには `❌` が出るがSlackに出ないと、届いていないことに誰も気づけない。
+    タイムアウトの場合はGAS側で送信済みのことがあるので、再送は人が判断する。
+    """
+    if not failures:
+        return
+    header = {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                f"❌ *LINEを送信できなかった授業があります（{len(failures)}件）*\n"
+                "届いていない可能性があります。トーク画面を確認し、必要なら手動で送信してください。"
+                "（タイムアウトの場合はGAS側で送信済みのことがあるため、二重送信に注意）"
+            ),
+        },
+    }
+    blocks = [header]
+    for s, target, err in failures:
+        title = f"*{s['生徒氏名']}（{target}宛）*\nエラー: {err}"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{title}\n```{get_msg(s)}```"}})
+    try:
+        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
+        print("✅ Slack通知送信（LINE送信失敗）")
+    except Exception as e:
+        print(f"⚠️ Slack通知失敗（LINE送信失敗）: {e}")
 
 
 def notify_slack_teacher_remind(students, slack_map):
@@ -436,7 +584,7 @@ def main():
         print(f"❌ {e}")
         sys.exit(1)
 
-    students = fetch_report(sf)
+    students, unparsed = fetch_report(sf)
     line_map, parent_line_map, slack_map = fetch_ids()
     if students and not line_map:
         # 名簿が空のまま進むと全員が「LINE IDなし」になり誰にも届かない。
@@ -449,6 +597,10 @@ def main():
         if name_key in PARENT_NOTIFY_TARGET_NAMES:
             s["parentLineUserId"] = parent_line_map.get(name_key, "")
 
+    # 推測した生徒名が名簿に無い行は、別人へ届くのを避けて手動送信の通知に回す。
+    students, unresolved_guesses = split_unresolved_guesses(students)
+    unparsed.extend(unresolved_guesses)
+
     with_id = [s for s in students if s["lineUserId"]]
     without_id = [s for s in students if not s["lineUserId"]]
     with_parent_id = [s for s in with_id if s.get("parentLineUserId")]
@@ -459,10 +611,12 @@ def main():
     ]
     print(
         f"\n📋 送信対象: {len(with_id)}名 / 保護者同時送信: {len(with_parent_id)}名"
-        f" / LINE IDなし: {len(without_id)}名 / 保護者のみ送信: {len(without_id_with_parent)}名\n"
+        f" / LINE IDなし: {len(without_id)}名 / 保護者のみ送信: {len(without_id_with_parent)}名"
+        f" / 生徒を特定できず: {len(unparsed)}件\n"
     )
 
     sent = failed = parent_sent = parent_failed = 0
+    send_failures = []
     for i, s in enumerate(with_id, 1):
         if args.dry_run:
             print(f"[DRY RUN {i}/{len(with_id)}] {s['生徒氏名']}")
@@ -482,6 +636,7 @@ def main():
         else:
             print(f"❌ {err}")
             failed += 1
+            send_failures.append((s, "本人", err))
 
         if s.get("parentLineUserId"):
             parent_s = dict(s)
@@ -494,6 +649,7 @@ def main():
             else:
                 print(f"❌ {err_parent}")
                 parent_failed += 1
+                send_failures.append((s, "保護者", err_parent))
             time.sleep(0.3)
 
         time.sleep(0.3)
@@ -515,6 +671,7 @@ def main():
         else:
             print(f"❌ {err_parent}")
             parent_failed += 1
+            send_failures.append((s, "保護者", err_parent))
         time.sleep(0.3)
 
     print("\n" + "=" * 50)
@@ -526,6 +683,10 @@ def main():
             notify_slack_no_id(without_id)
         if parent_uid_missing:
             notify_slack_parent_uid_missing(parent_uid_missing)
+        if unparsed:
+            notify_slack_unparsed(unparsed)
+        if send_failures:
+            notify_slack_send_failed(send_failures)
         notify_slack_teacher_remind(students, slack_map)
     print("=" * 50)
 
@@ -535,6 +696,14 @@ def main():
             print("─" * 40)
             print(f"【{s['生徒氏名']}】")
             print(get_msg(s))
+            print()
+
+    if unparsed:
+        print(f"\n⚠️ 生徒を特定できない授業 {len(unparsed)}件 — 授業名を直して手動送信してください\n")
+        for s in unparsed:
+            print("─" * 40)
+            print(f"【{s['生徒氏名'] or '生徒名不明'}】{s['授業名']}")
+            print(f"{s['開始時間']}‐{s['終了時間']}　担当：{s['担当']}")
             print()
 
 

@@ -35,7 +35,6 @@ jobs:
       CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
       PARENT_LINE_SPREADSHEET_ID: ${{ secrets.PARENT_LINE_SPREADSHEET_ID }}
       PARENT_LINE_SHEET_NAME: ${{ secrets.PARENT_LINE_SHEET_NAME }}
-      PARENT_NOTIFY_TARGET_NAMES: ${{ secrets.PARENT_NOTIFY_TARGET_NAMES }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
