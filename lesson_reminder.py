@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import sys
@@ -53,6 +54,37 @@ ROSTER_TOKEN = required_env("ROSTER_TOKEN")
 SLACK_WEBHOOK = required_env("SLACK_WEBHOOK")
 SLACK_TEACHER_WEBHOOK = required_env("SLACK_TEACHER_WEBHOOK")
 
+# GASへは1回にまとめて渡す。GAS側の実行時間の上限は6分で、1件あたりLINE APIに
+# 0.3秒ほどなので、この件数なら余裕がある。念のため上限を切って分割する。
+# ただしこれは通常時の見積もりで、6分以内を保証する計算ではない。
+BATCH_SIZE = 40
+SEND_TIMEOUT_SEC = 180
+
+# POSTの応答を受け取れなかったときに、GASへ結果を取りに行く間隔（秒）。
+# GASがまだ送信中のこともあるので、間隔を広げながら諦めるまでの回数だけ試す。
+# 全部外しても合計103秒で、ワークフローの timeout-minutes: 15 には収まる。
+RESULT_RETRY_WAITS = (3, 10, 30, 60)
+RESULT_FETCH_TIMEOUT_SEC = 60
+
+# Slackは1メッセージ50 blocks・section本文3000字が上限。超えると黙って弾かれる。
+SLACK_MAX_BLOCKS = 50
+SLACK_MAX_TEXT = 2900
+# 429で Retry-After を指定されたとき、待って投げ直してよい上限。
+# これより長い指定は素直に諦める（送信処理の終了を通知のために遅らせない）。
+SLACK_RETRY_AFTER_MAX_SEC = 30
+
+# 429で締め出され、指定に従えないまま諦めた宛先。この実行中は以降の通知も送らない。
+# main() は通知関数を4本続けて呼ぶので、1回の呼び出しの中でしか止めないと、
+# Retry-Afterを無視して同じチャンネルへ投げ続けることになる。
+# 宛先ごとに持つので、生徒向けが止まっても講師リマインドは送れる。
+_SLACK_BLOCKED_WEBHOOKS = set()
+
+# LINEがHTTPで明示的に拒否したときだけ「届いていない」と言い切れる。
+# GASは UrlFetchApp の例外を code 0 の failed に変換するので（コード.js の
+# makeErrorResponse）、LINEが受理した直後に応答を失っただけでも failed になる。
+# code 0・5xx・code欠落を未達に混ぜると、届いているものを手動再送させてしまう。
+UNDELIVERED_CODES = {400, 401, 403, 404, 429}
+
 
 def normalize(s):
     return unicodedata.normalize("NFKC", s).replace(" ", "").replace("　", "").strip()
@@ -100,8 +132,11 @@ COURSE_RULES: list = _load_course_rules()
 
 # 体験回はコース名が同じでも開始時刻が前倒しにならない。
 # 2回目以降の体験（体験2 / 体験２ / 体験②）は通常回と同じ扱いにする。
-TRIAL_PATTERN = re.compile(os.getenv("TRIAL_PATTERN", "体験"))
-TRIAL_EXCEPT_PATTERN = re.compile(os.getenv("TRIAL_EXCEPT_PATTERN", "体験[2２②]"))
+# 空文字は「未設定」として扱う。ワークフローの env に未設定のSecretを並べると
+# 空文字が渡ってくるが、空の正規表現は何にでも一致するため、既定に戻さないと
+# 体験回の判定が裏返る（エラーは出ず、通知時刻だけがずれる）。
+TRIAL_PATTERN = re.compile(os.getenv("TRIAL_PATTERN") or "体験")
+TRIAL_EXCEPT_PATTERN = re.compile(os.getenv("TRIAL_EXCEPT_PATTERN") or "体験[2２②]")
 
 # 名称にこのキーワードを含む授業はリマインドしない（担当未定の仮枠・社内研修など）
 SKIP_LESSON_KEYWORDS = [
@@ -413,47 +448,154 @@ def find_slack_id(teacher, slack_map):
     return "", 0
 
 
+def slack_section(text):
+    """sectionを1つ作る。text は3000字が上限なので手前で切る。"""
+    if len(text) > SLACK_MAX_TEXT:
+        text = _truncate_for_slack(text)
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
+def _truncate_for_slack(text):
+    """3000字の手前で切り、開いたままのコードフェンスを閉じる。
+
+    送信本文は ``` で囲んで載せている。閉じないまま切ると以降の表示が崩れ、
+    手動送信する文面を読み違える。切れ目が ``` の1文字目・2文字目に当たると
+    中途半端なバッククォートが残り、開閉を数え違えるので先に落とす。
+    """
+    body = text[:SLACK_MAX_TEXT]
+    partial = len(body) - len(body.rstrip("`"))
+    if partial in (1, 2):
+        body = body[:-partial]
+    body += "…（省略）"
+    if body.count("```") % 2 == 1:
+        body += "\n```"
+    return body
+
+
+def _slack_pages(groups):
+    """(見出し, 詳細の並び) を、1メッセージ50 blocks以下のページに割る。
+
+    50個ずつ機械的に切ると、後半のページだけを見た人には何の通知か分からない。
+    未達と結果不明が混ざったまま切れると、後続ページから「投げ直すと二重送信になる」
+    という注意が消えて、届いている生徒に手動再送をかけさせてしまう。
+    そのためページをまたぐグループには見出しを毎回付け直す。
+    """
+    pages, page = [], []
+    for header, details in groups:
+        if not details:
+            continue
+        index = 0
+        while index < len(details):
+            if len(page) + 2 > SLACK_MAX_BLOCKS:
+                # 見出しと詳細1つぶんが入らないなら改ページする（見出しだけのページを作らない）
+                pages.append(page)
+                page = []
+            page.append(header)
+            room = SLACK_MAX_BLOCKS - len(page)
+            page.extend(details[index:index + room])
+            index += room
+            if len(page) >= SLACK_MAX_BLOCKS:
+                pages.append(page)
+                page = []
+    if page:
+        pages.append(page)
+    return pages
+
+
+def _slack_retry_after(response):
+    """429の Retry-After を (待ってよい秒数 or None, ヘッダーの生値) で返す。"""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        raw = None
+    try:
+        seconds = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, raw
+    if 0 <= seconds <= SLACK_RETRY_AFTER_MAX_SEC:
+        return seconds, raw
+    return None, raw
+
+
+def post_slack_payload(webhook, payload, label):
+    """Incoming Webhookへ1通投げる。同じ宛先へ続けて送ってよければ True。
+
+    Incoming Webhookの成功はHTTP 200 かつ本文が `ok` のときだけ（JSON APIの
+    「200だが ok:false」とは別物）。ここを見ないと弾かれた通知を送れたつもりで見逃す。
+
+    ここで例外を投げないのは、通知の失敗で送信処理ごと落とすと日次マーカーが残らず、
+    次の実行で全員に再送されるため。気づく手段はログに寄せる。
+    """
+    if webhook in _SLACK_BLOCKED_WEBHOOKS:
+        # 宛先URLは秘密なので出さない。どの通知が送れていないかはlabelで分かる。
+        print(f"⚠️ Slack通知を送っていません（{label}）: "
+              "レート制限のため、この実行では同じ宛先への通知を止めています")
+        return False
+    for attempt in (1, 2):
+        try:
+            res = requests.post(webhook, json=payload, timeout=10)
+        except Exception as e:
+            print(f"⚠️ Slack通知失敗（{label}）: {e}")
+            return True
+        code = getattr(res, "status_code", None)
+        body = str(getattr(res, "text", "") or "")
+        if code == 200 and body.strip() == "ok":
+            print(f"✅ Slack通知送信（{label}）")
+            return True
+        if code != 429:
+            print(f"⚠️ Slack通知を拒否されました（{label}・HTTP {code}）: {body[:200]}")
+            return True
+        # 429は待てば通る。ただし待つのは1回だけで、指定に従えないなら投げ直さない。
+        # 同じチャンネルには他の送信元もいるので、逆らって投げると締め出しが伸びる。
+        if attempt == 2:
+            _SLACK_BLOCKED_WEBHOOKS.add(webhook)
+            print(f"⚠️ Slack通知がレート制限のままです（{label}）。"
+                  "この実行では同じ宛先への通知を止めます")
+            return False
+        wait, raw = _slack_retry_after(res)
+        if wait is None:
+            _SLACK_BLOCKED_WEBHOOKS.add(webhook)
+            print(f"⚠️ Slack通知がレート制限（{label}・Retry-After: {raw}）。"
+                  "指定に従えないので、この実行では同じ宛先への通知を止めます")
+            return False
+        print(f"⚠️ Slack通知がレート制限（{label}）。{wait}秒待って1回だけ送り直します")
+        time.sleep(wait)
+    return True
+
+
+def post_slack_groups(groups, label):
+    """見出し付きのまとまりをSlackへ投げる。50 blocksを超えるぶんは分割する。"""
+    pages = _slack_pages(groups)
+    for i, page in enumerate(pages):
+        if not post_slack_payload(SLACK_WEBHOOK, {"blocks": page}, label):
+            remaining = len(pages) - i - 1
+            if remaining:
+                print(f"⚠️ Slack通知の残り{remaining}ページを送っていません（{label}）")
+            return
+        if i + 1 < len(pages):
+            # Incoming Webhookの目安は1チャンネルあたり毎秒1通（Slack公式）。
+            time.sleep(1)
+
+
 def notify_slack_parent_uid_missing(students):
     if not students:
         return
-    header = {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"⚠️ *保護者LINE UID未登録の生徒がいます（{len(students)}名）*\n手動で保護者へLINEを送信してください。",
-        },
-    }
-    blocks = [header]
-    for s in students:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{s['生徒氏名']}（保護者宛）*\n```{get_msg(s)}```"},
-        })
-    try:
-        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
-        print("✅ Slack通知送信（保護者UID未登録）")
-    except Exception as e:
-        print(f"⚠️ Slack通知失敗（保護者UID未登録）: {e}")
+    header = slack_section(
+        f"⚠️ *保護者LINE UID未登録の生徒がいます（{len(students)}名）*\n手動で保護者へLINEを送信してください。"
+    )
+    details = [slack_section(f"*{s['生徒氏名']}（保護者宛）*\n```{get_msg(s)}```") for s in students]
+    post_slack_groups([(header, details)], "保護者UID未登録")
 
 
 def notify_slack_no_id(students):
     if not students:
         return
-    header = {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"⚠️ *LINE ID未登録の生徒がいます（{len(students)}名）*\n手動でLINEを送信してください。",
-        },
-    }
-    blocks = [header]
-    for s in students:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{s['生徒氏名']}*\n```{get_msg(s)}```"}})
-    try:
-        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
-        print("✅ Slack通知送信（IDなし生徒）")
-    except Exception as e:
-        print(f"⚠️ Slack通知失敗: {e}")
+    header = slack_section(
+        f"⚠️ *LINE ID未登録の生徒がいます（{len(students)}名）*\n手動でLINEを送信してください。"
+    )
+    details = [slack_section(f"*{s['生徒氏名']}*\n```{get_msg(s)}```") for s in students]
+    post_slack_groups([(header, details)], "IDなし生徒")
 
 
 def notify_slack_unparsed(lessons):
@@ -464,18 +606,12 @@ def notify_slack_unparsed(lessons):
     """
     if not lessons:
         return
-    header = {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"⚠️ *生徒を特定できない授業があります（{len(lessons)}件）*\n"
-                "授業名の `[生徒名]` が壊れている可能性があります。"
-                "Salesforceの授業名を直したうえで、手動でLINEを送信してください。"
-            ),
-        },
-    }
-    blocks = [header]
+    header = slack_section(
+        f"⚠️ *生徒を特定できない授業があります（{len(lessons)}件）*\n"
+        "授業名の `[生徒名]` が壊れている可能性があります。"
+        "Salesforceの授業名を直したうえで、手動でLINEを送信してください。"
+    )
+    details = []
     for s in lessons:
         title = f"*{s['生徒氏名']}（推測・名簿に一致なし）*\n" if s.get("生徒氏名") else ""
         detail = (
@@ -483,42 +619,45 @@ def notify_slack_unparsed(lessons):
             f"{s['開始時間']}‐{s['終了時間']}\n"
             f"担当：{s['担当']}"
         )
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{title}```{detail}```"}})
-    try:
-        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
-        print("✅ Slack通知送信（生徒を特定できない授業）")
-    except Exception as e:
-        print(f"⚠️ Slack通知失敗（生徒を特定できない授業）: {e}")
+        details.append(slack_section(f"{title}```{detail}```"))
+    post_slack_groups([(header, details)], "生徒を特定できない授業")
 
 
 def notify_slack_send_failed(failures):
-    """LINE送信に失敗した分を通知する。
+    """LINE送信の結果を通知する。要素は (授業, 宛先ラベル, 理由, 未達が確定したか)。
 
     ログには `❌` が出るがSlackに出ないと、届いていないことに誰も気づけない。
-    タイムアウトの場合はGAS側で送信済みのことがあるので、再送は人が判断する。
+    ただし「送れなかった」と「結果を確認できなかった」は別物。2026-09-10に14件を
+    一律「送信できなかった」として流したが、GASの実行ログでは全部送信済みだった。
+    毎日オオカミ少年をやると本当の未達を見落とすので、2つを分けて出す。
     """
     if not failures:
         return
-    header = {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"❌ *LINEを送信できなかった授業があります（{len(failures)}件）*\n"
-                "届いていない可能性があります。トーク画面を確認し、必要なら手動で送信してください。"
-                "（タイムアウトの場合はGAS側で送信済みのことがあるため、二重送信に注意）"
-            ),
-        },
-    }
-    blocks = [header]
-    for s, target, err in failures:
-        title = f"*{s['生徒氏名']}（{target}宛）*\nエラー: {err}"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{title}\n```{get_msg(s)}```"}})
-    try:
-        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10)
-        print("✅ Slack通知送信（LINE送信失敗）")
-    except Exception as e:
-        print(f"⚠️ Slack通知失敗（LINE送信失敗）: {e}")
+
+    def details(items):
+        return [
+            slack_section(f"*{s['生徒氏名']}（{target}宛）*\nエラー: {err}\n```{get_msg(s)}```")
+            for s, target, err, _confirmed in items
+        ]
+
+    undelivered = [f for f in failures if f[3]]
+    unknown = [f for f in failures if not f[3]]
+
+    # 見出しと詳細を組にして渡す。分割されても各ページに見出しが再掲されるので、
+    # 後続ページだけを見た人が未達と結果不明を取り違えることがない。
+    groups = []
+    if undelivered:
+        groups.append((slack_section(
+            f"❌ *LINEを送信できませんでした（{len(undelivered)}件）*\n"
+            "LINEが受け取りを断りました。トーク画面を確認し、手動で送信してください。"
+        ), details(undelivered)))
+    if unknown:
+        groups.append((slack_section(
+            f"⚠️ *LINEの送信結果を確認できませんでした（{len(unknown)}件）*\n"
+            "GASは受け取っていれば最後まで送るので、届いていることが多いです。"
+            "投げ直すと二重送信になるため、トーク画面を見てから判断してください。"
+        ), details(unknown)))
+    post_slack_groups(groups, "LINE送信失敗")
 
 
 def notify_slack_teacher_remind(students, slack_map):
@@ -541,29 +680,177 @@ def notify_slack_teacher_remind(students, slack_map):
         for s in lessons:
             lines.append(f"{s['生徒氏名']}｜{s['開始時間']}｜{s['終了時間']}｜{s['担当']}")
 
-    try:
-        requests.post(SLACK_TEACHER_WEBHOOK, json={"text": "\n".join(lines)}, timeout=10)
-        print("✅ Slack講師リマインド送信")
-    except Exception as e:
-        print(f"⚠️ Slack講師リマインド失敗: {e}")
+    post_slack_payload(SLACK_TEACHER_WEBHOOK, {"text": "\n".join(lines)}, "講師リマインド")
 
 
-def send(s):
-    # タイムアウトしてもGAS側では送信済みのことがあるためリトライはしない。
-    # 待ち時間だけ長めに取って取りこぼしを減らす。
-    try:
-        r = requests.post(
-            GAS_URL,
-            json={
-                "token": ROSTER_TOKEN,
-                "students": [{"lineUserId": s["lineUserId"], "name": s["生徒氏名"], "message": get_msg(s)}],
-            },
-            timeout=30,
-        ).json()
-        res = r.get("results", [{}])[0]
-        return res.get("status") == "sent", res.get("error", "")
-    except Exception as e:
-        return False, str(e)
+def _check_result_alignment(chunk, got):
+    """送った並びと返ってきた並びが食い違っていないかを見る。合っていれば空文字。
+
+    並びがずれても、送信先と本文の組み合わせは狂わない（GASへは宛先と本文を組にして
+    渡していて、GASもその組で送るため）。狂うのは成功／失敗の割り当てだけだが、
+    そのまま通知すると届いている生徒に手動再送をかけることになる。
+    ずれを見つけても並べ替えや再送はしない。判断を人に返す。
+    """
+    if len(got) != len(chunk):
+        return f"結果の件数が合いません（送信{len(chunk)}件 / 応答{len(got)}件）"
+    for (lesson, _label, _uid), res in zip(chunk, got):
+        if not isinstance(res, dict):
+            return "応答の形式が想定と違います"
+        name = res.get("name")
+        if not name:
+            # GASは成功・失敗・catchのどの枝でも name を返し、こちらが渡す name も常に非空。
+            # 無いということはこの送信経路の応答ではないので、並びを突き合わせられない。
+            return "結果に生徒名がありません"
+        if name != lesson["生徒氏名"]:
+            return f"結果の並びが送信順と違います（{lesson['生徒氏名']} のはずが {name}）"
+    return ""
+
+
+def _classify_result(res, label):
+    """1件ぶんの結果を (ok, 理由, 未達が確定したか) にする。
+
+    未達を言い切れるのはLINEがHTTPで断ったときだけ。GASは UrlFetchApp の例外を
+    code 0 の failed に変換するので、LINEが受理した直後に応答を失っただけでも
+    failed で返ってくる。これを未達に混ぜると、届いているものを手動再送させてしまう。
+
+    GASが返す形は3つだけ。
+      成功        : {name, status:'sent', recipient}
+      LINEが非200 : {name, status:'failed', recipient, error, code}
+      GAS側の例外 : {name, status:'failed', error}   ← recipient も code も付かない
+    どれにも当てはまらない形は「結果を確認できなかった」に寄せる。
+    """
+    recipient = res.get("recipient")
+    expected = "parent" if label == "保護者" else "student"
+    if recipient is not None and recipient != expected:
+        # GASは宛先UIDがlineシートE列にあるかで生徒/保護者を決める。同じUIDが
+        # 生徒欄と保護者欄の両方に入っていると、並びが正しくてもここが食い違う。
+        # 並びのずれとは限らないので、chunk全体ではなくこの1件だけを結果不明にする。
+        return False, f"宛先の種別が合いません（{label}宛のはずが {recipient}）", False
+    status = res.get("status")
+    if status == "sent":
+        if recipient is None:
+            # 成功の枝は必ず recipient を付ける。無い成功はこの送信経路の応答ではない。
+            return False, f"結果を確認できませんでした（{label}宛の成功応答に宛先の種別がありません）", False
+        return True, "", True
+    reason = res.get("error") or json.dumps(res, ensure_ascii=False)[:200]
+    code = res.get("code")
+    # code だけで決めると status:'queued' + code:400 まで未達確定になる。
+    # GASが failed と言い、かつLINEがHTTPで断ったコードが付いているときに限る。
+    # recipient も要る。LINEが非200を返した枝は必ず recipient を付けるので、
+    # 無いのに拒否codeだけ付いた応答は契約の外。未達と言い切らずに人へ返す。
+    if status == "failed" and recipient == expected and isinstance(code, int) and code in UNDELIVERED_CODES:
+        return False, reason, True
+    return False, reason, False
+
+
+def _new_request_id(index):
+    """この送信を指す使い捨ての名前。GAS側が結果を控えるときのキーになる。
+
+    実行日時を頭に付けるのは、GASのプロパティを覗いたときにいつのものか分かるようにするため。
+    """
+    return f"{datetime.now(JST).strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}-{index}"
+
+
+def fetch_saved_send_results(request_id):
+    """GASに控えてある送信結果を取りに行く。拾えなければ None。
+
+    POSTの応答はGoogleのウェブアプリ層を通るので、GASが送り終えていてもこちらに
+    届かないことがある（2026-09-13の12:07、29件・53秒の実行で応答が doGet の
+    unauthorized に化けた）。結果はGAS側に残っているので取りに行く。
+
+    引き取れなかったことは「届いていない」を意味しない。GASに届いていない可能性も
+    同じだけ残るので、呼び出し側は従来どおり「結果を確認できなかった」に落とす。
+    """
+    for wait in RESULT_RETRY_WAITS:
+        # GASがまだ送信中のことがあるので、1回目から間を置く。
+        time.sleep(wait)
+        try:
+            body = requests.get(
+                GAS_URL,
+                params={"token": ROSTER_TOKEN, "action": "lessonSendResult", "requestId": request_id},
+                timeout=RESULT_FETCH_TIMEOUT_SEC,
+            ).json()
+        except Exception as e:
+            print(f"   …結果の引き取りに失敗（{e}）", flush=True)
+            continue
+        if not isinstance(body, dict):
+            continue
+        # 別のidの控えを読むと、前回の実行の結果を今回の結果として扱ってしまう。
+        if str(body.get("requestId") or "") != request_id:
+            continue
+        results = body.get("results")
+        if isinstance(results, list):
+            print(f"   …GASに控えた結果を引き取れました（{len(results)}件）", flush=True)
+            return results
+    return None
+
+
+def _read_send_results(chunk, body, request_id=None, failure_note=""):
+    """GASの応答を chunk と同じ長さの (ok, 理由, 未達が確定したか) の並びにする。
+
+    応答から結果を読めなかったときは、GASに控えた結果を引き取りに行く（request_id がある場合）。
+    """
+    n = len(chunk)
+    if n == 0:
+        # 0件の日に投げる「実行した記録」用のPOST。読む結果が無いので引き取りにも行かない。
+        return []
+    got = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(got, list) and request_id:
+        print("⚠️ 送信の応答から結果を読めませんでした。GASに控えた結果を取りに行きます", flush=True)
+        got = fetch_saved_send_results(request_id)
+    if not isinstance(got, list):
+        # POSTが302の追従でGETに化けて doGet が動くと、合言葉をURLクエリで見るため
+        # {"error":"unauthorized"} が返る。中身を捨てるとSlackのエラー欄が空欄になり
+        # 原因が追えなくなる（2026-09-10に14件中5件がこれだった）。
+        if failure_note:
+            return [(False, f"結果を確認できませんでした（{failure_note}）", False)] * n
+        note = json.dumps(body, ensure_ascii=False)[:200] if body is not None else "空の応答"
+        return [(False, f"結果を確認できませんでした（想定外の応答: {note}）", False)] * n
+
+    misaligned = _check_result_alignment(chunk, got)
+    if misaligned:
+        return [(False, f"結果を確認できませんでした（{misaligned}）", False)] * n
+
+    return [_classify_result(res, label) for (_lesson, label, _uid), res in zip(chunk, got)]
+
+
+def send_all(targets):
+    """[(授業, 宛先ラベル, LINE UID), ...] をまとめてGASへ渡す。
+
+    1名1POSTだと往復のたびにGoogleのウェブアプリ層で詰まる余地ができる。
+    2026-09-10は29往復のうち14回がそれで「失敗」になった（LINEは全部届いていた）。
+    往復回数そのものが事故の確率なので、1回にまとめる。
+
+    タイムアウトしてもリトライはしない。GAS側は受け取った時点で最後まで送るので、
+    投げ直すと二重送信になる。応答を受け取れなかったときは投げ直さず、
+    GASが控えた結果を requestId で引き取りに行く。
+    """
+    outcomes = []
+    chunks = [targets[start:start + BATCH_SIZE] for start in range(0, len(targets), BATCH_SIZE)]
+    # 対象が0件の日も1回だけ投げる。GASは students が空なら誰にも送らないが、
+    # 「今日の実行がGASまで届いた」記録が残る。これが無いと、受け取る側の見張りから
+    # 授業が0件だった日と止まった日を見分けられない（2026-09-14）。
+    if not chunks:
+        chunks = [[]]
+    for index, chunk in enumerate(chunks):
+        request_id = _new_request_id(index)
+        payload = [
+            {"lineUserId": uid, "name": lesson["生徒氏名"], "message": get_msg(lesson)}
+            for lesson, _label, uid in chunk
+        ]
+        body = None
+        failure_note = ""
+        try:
+            body = requests.post(
+                GAS_URL,
+                json={"token": ROSTER_TOKEN, "requestId": request_id, "students": payload},
+                timeout=SEND_TIMEOUT_SEC,
+            ).json()
+        except Exception as e:
+            # 投げ直さない。GASは受け取っていれば送り終えているので、結果は引き取りに行く。
+            failure_note = str(e)
+        outcomes.extend(_read_send_results(chunk, body, request_id, failure_note))
+    return outcomes
 
 
 def main():
@@ -615,64 +902,42 @@ def main():
         f" / 生徒を特定できず: {len(unparsed)}件\n"
     )
 
+    # 本人と保護者を1本の並びにする。GASへはこの順のまま渡し、同じ順で結果が返る。
+    targets = []
+    for s in with_id:
+        targets.append((s, "本人", s["lineUserId"]))
+        if s.get("parentLineUserId"):
+            targets.append((s, "保護者", s["parentLineUserId"]))
+    for s in without_id_with_parent:
+        targets.append((s, "保護者", s["parentLineUserId"]))
+
+    if args.dry_run:
+        for i, (s, label, _uid) in enumerate(targets, 1):
+            print(f"[DRY RUN {i}/{len(targets)}] {s['生徒氏名']}（{label}宛）")
+            print("-" * 40)
+            print(get_msg(s))
+            print()
+        outcomes = []
+    else:
+        print(f"📤 {len(targets)}件をまとめて送信中...", flush=True)
+        outcomes = send_all(targets)
+
     sent = failed = parent_sent = parent_failed = 0
     send_failures = []
-    for i, s in enumerate(with_id, 1):
-        if args.dry_run:
-            print(f"[DRY RUN {i}/{len(with_id)}] {s['生徒氏名']}")
-            print("-" * 40)
-            print(get_msg(s))
-            if s.get("parentLineUserId"):
-                print(f"\n[DRY RUN 保護者同時送信] {s['生徒氏名']}")
-                print("-" * 40)
-                print(get_msg(s))
-            print()
-            continue
-        print(f"📤 [{i}/{len(with_id)}] {s['生徒氏名']}...", end=" ", flush=True)
-        ok, err = send(s)
+    for (s, label, _uid), (ok, err, confirmed) in zip(targets, outcomes):
+        mark = "📤" if label == "本人" else "👪"
+        print(f"{mark} {s['生徒氏名']}（{label}宛）... " + ("✅" if ok else f"❌ {err}"))
         if ok:
-            print("✅")
-            sent += 1
-        else:
-            print(f"❌ {err}")
-            failed += 1
-            send_failures.append((s, "本人", err))
-
-        if s.get("parentLineUserId"):
-            parent_s = dict(s)
-            parent_s["lineUserId"] = s["parentLineUserId"]
-            print(f"👪 保護者にも送信: {s['生徒氏名']}...", end=" ", flush=True)
-            ok_parent, err_parent = send(parent_s)
-            if ok_parent:
-                print("✅")
-                parent_sent += 1
+            if label == "本人":
+                sent += 1
             else:
-                print(f"❌ {err_parent}")
-                parent_failed += 1
-                send_failures.append((s, "保護者", err_parent))
-            time.sleep(0.3)
-
-        time.sleep(0.3)
-
-    for s in without_id_with_parent:
-        if args.dry_run:
-            print(f"\n[DRY RUN 保護者のみ送信] {s['生徒氏名']}")
-            print("-" * 40)
-            print(get_msg(s))
-            print()
-            continue
-        parent_s = dict(s)
-        parent_s["lineUserId"] = s["parentLineUserId"]
-        print(f"👪 保護者のみ送信: {s['生徒氏名']}...", end=" ", flush=True)
-        ok_parent, err_parent = send(parent_s)
-        if ok_parent:
-            print("✅")
-            parent_sent += 1
+                parent_sent += 1
         else:
-            print(f"❌ {err_parent}")
-            parent_failed += 1
-            send_failures.append((s, "保護者", err_parent))
-        time.sleep(0.3)
+            if label == "本人":
+                failed += 1
+            else:
+                parent_failed += 1
+            send_failures.append((s, label, err, confirmed))
 
     print("\n" + "=" * 50)
     if not args.dry_run:

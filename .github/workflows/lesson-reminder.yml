@@ -35,6 +35,13 @@ jobs:
       CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
       PARENT_LINE_SPREADSHEET_ID: ${{ secrets.PARENT_LINE_SPREADSHEET_ID }}
       PARENT_LINE_SHEET_NAME: ${{ secrets.PARENT_LINE_SHEET_NAME }}
+      # コース名・体験回・除外キーワードの判定表。
+      # ここに並べ忘れると、Secretに値があってもジョブには渡らず、
+      # 前倒し補正なし・除外なしのまま何事もなく送信される。
+      COURSE_RULES: ${{ secrets.COURSE_RULES }}
+      TRIAL_PATTERN: ${{ secrets.TRIAL_PATTERN }}
+      TRIAL_EXCEPT_PATTERN: ${{ secrets.TRIAL_EXCEPT_PATTERN }}
+      SKIP_LESSON_KEYWORDS: ${{ secrets.SKIP_LESSON_KEYWORDS }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -107,11 +114,18 @@ jobs:
 
       # 失敗しても誰も気づけず、生徒に届かないまま終わる事故を防ぐ。
       # マーカーを残さないので、次のディスパッチが自動リトライになる。
+      #
+      # cancelled() も見る。timeout-minutes の打ち切りも手動キャンセルも conclusion は
+      # cancelled になるので、failure() だけでは通知ステップ自体が動かなかった（実測）。
+      # ランナーごと消えた場合は何も動かないので、
+      # 「Slackが静か＝正常」とは読めないままであることに注意。
       - name: Notify Slack on failure
-        if: ${{ failure() || inputs.test_notify == 'true' }}
+        if: ${{ failure() || cancelled() || inputs.test_notify == 'true' }}
         run: |
           if [ "${{ inputs.test_notify }}" = "true" ]; then
             HEAD_LINE=":test_tube: [疎通テスト] リマインドの失敗通知です。実際の失敗ではありません。"
+          elif [ "${{ job.status }}" = "cancelled" ]; then
+            HEAD_LINE=":rotating_light: リマインドが途中で打ち切られました。生徒へのLINEが未送信の可能性があります。"
           else
             HEAD_LINE=":rotating_light: リマインドが失敗しました。生徒へのLINEが未送信の可能性があります。"
           fi

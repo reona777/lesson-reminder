@@ -65,6 +65,17 @@ def test_2回目の体験は通常回と同じ前倒しになる():
         assert tr.get_offset(lesson(f"[生徒]標準コースL {suffix}")) == 2
 
 
+def test_体験回の判定は空文字を渡されても既定に戻る():
+    """未設定のSecretをワークフローの env に並べると、空文字が渡ってくる。
+
+    空の正規表現は何にでも一致するので、空文字を「未設定」として扱わないと
+    体験回の判定が丸ごと裏返る。エラーにならず通知時刻だけがずれる。
+    """
+    tr = load(TRIAL_PATTERN="", TRIAL_EXCEPT_PATTERN="")
+    assert tr.get_offset(lesson("[生徒]標準コースL 体験")) == 0
+    assert tr.get_offset(lesson("[生徒]標準コースL 体験2")) == 2
+
+
 def test_判定表が未設定なら前倒しはしない():
     tr = load(COURSE_RULES="")
     assert tr.get_offset(lesson("[生徒]標準コースL")) == 0

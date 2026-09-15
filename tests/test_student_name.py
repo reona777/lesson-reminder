@@ -136,6 +136,14 @@ class TestSplitUnresolvedGuesses:
         assert unresolved == []
 
 
+class _SlackRes:
+    """Incoming Webhookが成功したときの応答。HTTP200かつ本文が ok。"""
+
+    status_code = 200
+    text = "ok"
+    headers = {}
+
+
 class TestNotifySlackSendFailed:
     """LINE送信の失敗はログにしか出ていなかったので、Slackに出ることを担保する。"""
 
@@ -164,27 +172,27 @@ class TestNotifySlackSendFailed:
         def fake_post(url, json=None, timeout=None):
             posted["url"] = url
             posted["json"] = json
-            return type("R", (), {"ok": True})()
+            return _SlackRes()
 
         monkeypatch.setattr(lr.requests, "post", fake_post)
-        lr.notify_slack_send_failed([(self._lesson(), "本人", "Read timed out")])
+        lr.notify_slack_send_failed([(self._lesson(), "本人", "UID形式が不正", True)])
 
         blocks = posted["json"]["blocks"]
         assert "1件" in blocks[0]["text"]["text"]
         body = blocks[1]["text"]["text"]
         assert "山田太郎（本人宛）" in body
-        assert "Read timed out" in body
+        assert "UID形式が不正" in body
         assert "明日の授業の詳細です。" in body
 
     def test_保護者宛の失敗も区別して入る(self, monkeypatch):
         posted = {}
         monkeypatch.setattr(
             lr.requests, "post",
-            lambda url, json=None, timeout=None: posted.update(json=json)
+            lambda url, json=None, timeout=None: (posted.update(json=json), _SlackRes())[1]
         )
         lr.notify_slack_send_failed([
-            (self._lesson(), "本人", "err1"),
-            (self._lesson(), "保護者", "err2"),
+            (self._lesson(), "本人", "err1", True),
+            (self._lesson(), "保護者", "err2", True),
         ])
         texts = [b["text"]["text"] for b in posted["json"]["blocks"]]
         assert any("（本人宛）" in t for t in texts)
@@ -195,4 +203,38 @@ class TestNotifySlackSendFailed:
             raise RuntimeError("slack down")
 
         monkeypatch.setattr(lr.requests, "post", boom)
-        lr.notify_slack_send_failed([(self._lesson(), "本人", "err")])
+        lr.notify_slack_send_failed([(self._lesson(), "本人", "err", True)])
+
+    def test_未達と結果不明は別の見出しで出る(self, monkeypatch):
+        """2026-09-10、届いていた14件を一律「送信できなかった」と流した。
+
+        毎日これをやると本当の未達を見落とすので、確定していない分は言い切らない。
+        """
+        posted = {}
+        monkeypatch.setattr(
+            lr.requests, "post",
+            lambda url, json=None, timeout=None: (posted.update(json=json), _SlackRes())[1]
+        )
+        lr.notify_slack_send_failed([
+            (self._lesson("確定した子"), "本人", "ユーザーにブロックされています", True),
+            (self._lesson("不明な子"), "本人", "結果を確認できませんでした（Read timed out）", False),
+        ])
+
+        texts = [b["text"]["text"] for b in posted["json"]["blocks"]]
+        headers = [t for t in texts if t.startswith(("❌", "⚠️"))]
+        assert len(headers) == 2
+        assert "送信できませんでした（1件）" in headers[0]
+        assert "確認できませんでした（1件）" in headers[1]
+        assert "二重送信" in headers[1]
+
+    def test_結果不明だけなら未達の見出しは出さない(self, monkeypatch):
+        posted = {}
+        monkeypatch.setattr(
+            lr.requests, "post",
+            lambda url, json=None, timeout=None: (posted.update(json=json), _SlackRes())[1]
+        )
+        lr.notify_slack_send_failed([(self._lesson(), "本人", "確認できず", False)])
+
+        texts = [b["text"]["text"] for b in posted["json"]["blocks"]]
+        assert not any("送信できませんでした" in t for t in texts)
+        assert any("確認できませんでした" in t for t in texts)
